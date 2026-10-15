@@ -215,6 +215,86 @@ export async function validateStarPreCheckout(query) {
 }
 
 /**
+ * Admin-only test checkout. It exercises order creation, config reservation,
+ * and delivery without inventing a Telegram payment. The config is returned
+ * to available stock and the payment row is marked `test`, not `paid`.
+ */
+export async function completeTestStarOrder(orderId, telegramId) {
+  const tx = await db.transaction("write");
+
+  try {
+    const result = await tx.execute({
+      sql: `SELECT o.id, o.telegram_id, o.status AS order_status, o.config_id,
+          p.status AS payment_status, c.config_text, c.status AS config_status,
+          c.order_id AS config_order_id
+        FROM orders o
+        JOIN payments p ON p.order_id = o.id
+        LEFT JOIN configs c ON c.id = o.config_id
+        WHERE o.id = ?`,
+      args: [orderId]
+    });
+    const order = result.rows[0];
+
+    if (!order || String(order.telegram_id) !== String(telegramId)) {
+      throw new Error("Тестовый заказ не найден или принадлежит другому пользователю.");
+    }
+
+    if (
+      order.order_status === "delivered" &&
+      order.payment_status === "test" &&
+      order.config_text
+    ) {
+      await tx.commit();
+      return { orderId: Number(orderId), configText: String(order.config_text), duplicate: true, fulfilled: true };
+    }
+
+    if (order.order_status !== "pending" || order.payment_status !== "pending") {
+      throw new Error("Тестовый заказ уже использован или отменён.");
+    }
+
+    if (
+      !order.config_id ||
+      order.config_status !== "reserved" ||
+      Number(order.config_order_id) !== Number(orderId) ||
+      !order.config_text
+    ) {
+      throw new Error("Резерв конфига не найден. Попробуй ещё раз.");
+    }
+
+    const configId = Number(order.config_id);
+    const configText = String(order.config_text);
+
+    const releaseResult = await tx.execute({
+      sql: `UPDATE configs SET status = 'available', order_id = NULL
+        WHERE id = ? AND status = 'reserved' AND order_id = ?`,
+      args: [configId, orderId]
+    });
+    if (Number(releaseResult.rowsAffected) !== 1) {
+      throw new Error("Не удалось вернуть конфиг на склад после теста.");
+    }
+
+    await tx.execute({
+      sql: `UPDATE orders
+        SET status = 'delivered', config_id = NULL,
+            delivered_at = COALESCE(delivered_at, datetime('now'))
+        WHERE id = ?`,
+      args: [orderId]
+    });
+    await tx.execute({
+      sql: `UPDATE payments SET status = 'test', updated_at = datetime('now')
+        WHERE order_id = ? AND status = 'pending'`,
+      args: [orderId]
+    });
+
+    await tx.commit();
+    return { orderId: Number(orderId), configText, duplicate: false, fulfilled: true };
+  } catch (error) {
+    await tx.rollback();
+    throw error;
+  }
+}
+
+/**
  * Process Telegram's successful_payment update idempotently. A retry of the
  * same update returns the same config instead of selling another stock item.
  */
