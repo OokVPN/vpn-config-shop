@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS payments (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS admin_sessions (
+  telegram_id TEXT PRIMARY KEY,
+  action TEXT NOT NULL,
+  data_json TEXT NOT NULL DEFAULT '{}',
+  chat_id TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_active
   ON products(active);
 
@@ -57,3 +66,6 @@ CREATE INDEX IF NOT EXISTS idx_configs_stock
 
 CREATE INDEX IF NOT EXISTS idx_orders_user
   ON orders(telegram_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_updated
+  ON admin_sessions(updated_at);
