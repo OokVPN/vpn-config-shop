@@ -46,8 +46,7 @@ async function expireOldOrders(tx) {
   });
 }
 
-/** Reserve exactly one stock item before sending the invoice. */
-export async function createStarOrder(productId, telegramId) {
+export async function createStarOrder(productId, telegramId, checkout = {}) {
   const tx = await db.transaction("write");
 
   try {
@@ -58,6 +57,7 @@ export async function createStarOrder(productId, telegramId) {
         FROM products WHERE id = ?`,
       args: [productId]
     });
+
     const product = productResult.rows[0];
 
     if (!product || Number(product.active) !== 1) {
@@ -65,16 +65,26 @@ export async function createStarOrder(productId, telegramId) {
     }
 
     const stars = Number(product.price_stars);
+
     if (!Number.isSafeInteger(stars) || stars < 1) {
       throw makeError("У товара указана некорректная цена в Stars.", "BAD_PRICE");
     }
 
     const orderResult = await tx.execute({
       sql: `INSERT INTO orders
-          (telegram_id, product_id, amount_rub, amount_stars, status)
-        VALUES (?, ?, ?, ?, 'pending')`,
-      args: [String(telegramId), productId, stars, stars]
+          (telegram_id, product_id, amount_rub, amount_stars, status,
+           checkout_chat_id, checkout_message_id)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+      args: [
+        String(telegramId),
+        productId,
+        stars,
+        stars,
+        checkout.chatId == null ? null : String(checkout.chatId),
+        checkout.messageId == null ? null : Number(checkout.messageId)
+      ]
     });
+
     const orderId = Number(orderResult.lastInsertRowid);
 
     const reservationResult = await tx.execute({
@@ -91,15 +101,14 @@ export async function createStarOrder(productId, telegramId) {
     });
 
     const reservation = reservationResult.rows[0];
+
     if (!reservation) {
       throw makeError("Конфиги этого товара закончились.", "OUT_OF_STOCK");
     }
 
-    const configId = Number(reservation.id);
-
     await tx.execute({
       sql: "UPDATE orders SET config_id = ? WHERE id = ?",
-      args: [configId, orderId]
+      args: [Number(reservation.id), orderId]
     });
 
     await tx.execute({
@@ -122,7 +131,6 @@ export async function createStarOrder(productId, telegramId) {
   }
 }
 
-/** Release a reservation if Telegram could not create the invoice. */
 export async function cancelStarOrder(orderId) {
   const tx = await db.transaction("write");
 
@@ -154,12 +162,14 @@ export async function cancelStarOrder(orderId) {
   }
 }
 
-/** Validate an invoice before Telegram collects Stars from the user. */
 export async function validateStarPreCheckout(query) {
   const orderId = parseOrderId(query.invoice_payload);
 
   if (!orderId) {
-    return { ok: false, errorMessage: "Счёт не распознан. Открой каталог и создай новый." };
+    return {
+      ok: false,
+      errorMessage: "Счёт не распознан. Открой каталог и создай новый."
+    };
   }
 
   if (query.currency !== "XTR") {
@@ -179,18 +189,28 @@ export async function validateStarPreCheckout(query) {
       WHERE o.id = ?`,
     args: [orderId]
   });
+
   const order = result.rows[0];
 
   if (!order || String(order.telegram_id) !== String(query.from.id)) {
-    return { ok: false, errorMessage: "Этот счёт принадлежит другому покупателю." };
+    return {
+      ok: false,
+      errorMessage: "Этот счёт принадлежит другому покупателю."
+    };
   }
 
   if (order.order_status !== "pending" || order.payment_status !== "pending") {
-    return { ok: false, errorMessage: "Счёт уже использован или истёк. Создай новый." };
+    return {
+      ok: false,
+      errorMessage: "Счёт уже использован или истёк. Создай новый."
+    };
   }
 
   if (Number(order.amount_stars) !== Number(query.total_amount)) {
-    return { ok: false, errorMessage: "Сумма счёта не совпадает. Создай новый счёт." };
+    return {
+      ok: false,
+      errorMessage: "Сумма счёта не совпадает. Создай новый счёт."
+    };
   }
 
   if (
@@ -198,7 +218,10 @@ export async function validateStarPreCheckout(query) {
     order.config_status !== "reserved" ||
     Number(order.config_order_id) !== orderId
   ) {
-    return { ok: false, errorMessage: "Этот конфиг больше не зарезервирован. Попробуй купить заново." };
+    return {
+      ok: false,
+      errorMessage: "Этот конфиг больше не зарезервирован. Попробуй купить заново."
+    };
   }
 
   const ageResult = await db.execute({
@@ -208,24 +231,25 @@ export async function validateStarPreCheckout(query) {
   });
 
   if (Number(ageResult.rows[0]?.valid) !== 1) {
-    return { ok: false, errorMessage: "Счёт истёк. Открой товар и создай новый." };
+    return {
+      ok: false,
+      errorMessage: "Счёт истёк. Открой товар и создай новый счёт."
+    };
   }
 
   return { ok: true };
 }
 
-/**
- * Admin-only test checkout. It exercises order creation, config reservation,
- * and delivery without inventing a Telegram payment. The config is returned
- * to available stock and the payment row is marked `test`, not `paid`.
- */
 export async function completeTestStarOrder(orderId, telegramId) {
   const tx = await db.transaction("write");
 
   try {
     const result = await tx.execute({
-      sql: `SELECT o.id, o.telegram_id, o.status AS order_status, o.config_id,
-          p.status AS payment_status, c.config_text, c.status AS config_status,
+      sql: `SELECT
+          o.id, o.telegram_id, o.status AS order_status, o.config_id,
+          o.checkout_chat_id, o.checkout_message_id,
+          p.status AS payment_status,
+          c.config_text, c.status AS config_status,
           c.order_id AS config_order_id
         FROM orders o
         JOIN payments p ON p.order_id = o.id
@@ -233,6 +257,7 @@ export async function completeTestStarOrder(orderId, telegramId) {
         WHERE o.id = ?`,
       args: [orderId]
     });
+
     const order = result.rows[0];
 
     if (!order || String(order.telegram_id) !== String(telegramId)) {
@@ -245,7 +270,17 @@ export async function completeTestStarOrder(orderId, telegramId) {
       order.config_text
     ) {
       await tx.commit();
-      return { orderId: Number(orderId), configText: String(order.config_text), duplicate: true, fulfilled: true };
+
+      return {
+        orderId: Number(orderId),
+        configText: String(order.config_text),
+        checkoutChatId: order.checkout_chat_id,
+        checkoutMessageId: order.checkout_message_id == null
+          ? null
+          : Number(order.checkout_message_id),
+        duplicate: true,
+        fulfilled: true
+      };
     }
 
     if (order.order_status !== "pending" || order.payment_status !== "pending") {
@@ -269,6 +304,7 @@ export async function completeTestStarOrder(orderId, telegramId) {
         WHERE id = ? AND status = 'reserved' AND order_id = ?`,
       args: [configId, orderId]
     });
+
     if (Number(releaseResult.rowsAffected) !== 1) {
       throw new Error("Не удалось вернуть конфиг на склад после теста.");
     }
@@ -280,6 +316,7 @@ export async function completeTestStarOrder(orderId, telegramId) {
         WHERE id = ?`,
       args: [orderId]
     });
+
     await tx.execute({
       sql: `UPDATE payments SET status = 'test', updated_at = datetime('now')
         WHERE order_id = ? AND status = 'pending'`,
@@ -287,17 +324,23 @@ export async function completeTestStarOrder(orderId, telegramId) {
     });
 
     await tx.commit();
-    return { orderId: Number(orderId), configText, duplicate: false, fulfilled: true };
+
+    return {
+      orderId: Number(orderId),
+      configText,
+      checkoutChatId: order.checkout_chat_id,
+      checkoutMessageId: order.checkout_message_id == null
+        ? null
+        : Number(order.checkout_message_id),
+      duplicate: false,
+      fulfilled: true
+    };
   } catch (error) {
     await tx.rollback();
     throw error;
   }
 }
 
-/**
- * Process Telegram's successful_payment update idempotently. A retry of the
- * same update returns the same config instead of selling another stock item.
- */
 export async function processSuccessfulStarPayment(message) {
   const payment = message?.successful_payment;
   const telegramId = message?.from?.id;
@@ -319,6 +362,7 @@ export async function processSuccessfulStarPayment(message) {
       sql: `SELECT
           o.id, o.telegram_id, o.product_id, o.amount_stars,
           o.status AS order_status, o.config_id,
+          o.checkout_chat_id, o.checkout_message_id,
           p.status AS payment_status, p.provider_payment_id,
           c.config_text, c.status AS config_status, c.order_id AS config_order_id
         FROM orders o
@@ -327,6 +371,7 @@ export async function processSuccessfulStarPayment(message) {
         WHERE o.id = ?`,
       args: [orderId]
     });
+
     const order = result.rows[0];
 
     if (!order || String(order.telegram_id) !== String(telegramId)) {
@@ -344,9 +389,14 @@ export async function processSuccessfulStarPayment(message) {
       order.config_text
     ) {
       await tx.commit();
+
       return {
         orderId,
         configText: String(order.config_text),
+        checkoutChatId: order.checkout_chat_id,
+        checkoutMessageId: order.checkout_message_id == null
+          ? null
+          : Number(order.checkout_message_id),
         duplicate: true,
         fulfilled: true
       };
@@ -357,20 +407,19 @@ export async function processSuccessfulStarPayment(message) {
     }
 
     if (order.order_status === "delivered" || order.payment_status === "paid") {
-      // A previously recorded payment without a deliverable config needs an admin check.
       await tx.commit();
       return { orderId, fulfilled: false, duplicate: true };
     }
 
     let configId = order.config_id ? Number(order.config_id) : null;
     let configText = order.config_text ? String(order.config_text) : null;
-    let alreadyReserved =
-      configId && order.config_status === "reserved" &&
+
+    const alreadyReserved =
+      configId &&
+      order.config_status === "reserved" &&
       Number(order.config_order_id) === orderId;
 
     if (!alreadyReserved) {
-      // If a reservation expired in a timing edge case, attempt to provide another
-      // available item instead of silently discarding a confirmed payment.
       const availableResult = await tx.execute({
         sql: `UPDATE configs
           SET status = 'sold', order_id = ?
@@ -385,9 +434,11 @@ export async function processSuccessfulStarPayment(message) {
       });
 
       const replacement = availableResult.rows[0];
+
       if (replacement) {
         configId = Number(replacement.id);
         configText = String(replacement.config_text);
+
         await tx.execute({
           sql: "UPDATE orders SET config_id = ? WHERE id = ?",
           args: [configId, orderId]
@@ -412,12 +463,14 @@ export async function processSuccessfulStarPayment(message) {
           WHERE id = ?`,
         args: [orderId]
       });
+
       await tx.execute({
         sql: `UPDATE payments
           SET provider_payment_id = ?, status = 'paid', updated_at = datetime('now')
           WHERE order_id = ?`,
         args: [chargeId, orderId]
       });
+
       await tx.commit();
       return { orderId, fulfilled: false, duplicate: false };
     }
@@ -439,9 +492,19 @@ export async function processSuccessfulStarPayment(message) {
     });
 
     await tx.commit();
-    return { orderId, configText, duplicate: false, fulfilled: true };
+
+    return {
+      orderId,
+      configText,
+      checkoutChatId: order.checkout_chat_id,
+      checkoutMessageId: order.checkout_message_id == null
+        ? null
+        : Number(order.checkout_message_id),
+      duplicate: false,
+      fulfilled: true
+    };
   } catch (error) {
     await tx.rollback();
     throw error;
   }
-}
+      }
