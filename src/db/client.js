@@ -11,8 +11,6 @@ export const db = createClient({
   authToken: TURSO_AUTH_TOKEN
 });
 
-// price_rub / amount_rub are retained for compatibility with the existing DB.
-// New bot code uses price_stars / amount_stars exclusively.
 const schema = [
   `CREATE TABLE IF NOT EXISTS users (
     telegram_id TEXT PRIMARY KEY,
@@ -47,6 +45,8 @@ const schema = [
     status TEXT NOT NULL DEFAULT 'pending'
       CHECK (status IN ('pending', 'paid', 'delivered', 'cancelled')),
     config_id INTEGER UNIQUE REFERENCES configs(id),
+    checkout_chat_id TEXT,
+    checkout_message_id INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     paid_at TEXT,
     delivered_at TEXT
@@ -90,7 +90,6 @@ async function ensureColumn(tableName, columnName, definition, legacyColumn) {
   );
 
   if (legacyColumn && columns.has(legacyColumn)) {
-    // This migration runs only once, when the new column is first added.
     await db.execute(
       `UPDATE ${tableName} SET ${columnName} = ${legacyColumn}`
     );
@@ -106,24 +105,28 @@ export function initDatabase() {
         await db.execute(sql);
       }
 
-      // Safe, one-time migrations for databases created before Stars support.
       await ensureColumn(
         "users",
         "terms_accepted",
         "INTEGER NOT NULL DEFAULT 0 CHECK (terms_accepted IN (0, 1))"
       );
+
       await ensureColumn(
         "products",
         "price_stars",
         "INTEGER NOT NULL DEFAULT 19 CHECK (price_stars > 0)",
         "price_rub"
       );
+
       await ensureColumn(
         "orders",
         "amount_stars",
         "INTEGER NOT NULL DEFAULT 19 CHECK (amount_stars > 0)",
         "amount_rub"
       );
+
+      await ensureColumn("orders", "checkout_chat_id", "TEXT");
+      await ensureColumn("orders", "checkout_message_id", "INTEGER");
     })().catch((error) => {
       initPromise = undefined;
       throw error;
