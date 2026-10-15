@@ -1,4 +1,6 @@
-import { db } from "../src/db/client.js";
+
+import { db, initDatabase } from "../src/db/client.js";
+
 import {
   sendMessage,
   answerCallbackQuery
@@ -24,11 +26,16 @@ async function showCatalog(chatId) {
   const result = await db.execute({
     sql: `
       SELECT
-        p.id, p.name, p.country, p.protocol, p.price_rub,
+        p.id,
+        p.name,
+        p.country,
+        p.protocol,
+        p.price_rub,
         COUNT(c.id) AS stock
       FROM products p
       LEFT JOIN configs c
-        ON c.product_id = p.id AND c.status = 'available'
+        ON c.product_id = p.id
+        AND c.status = 'available'
       WHERE p.active = 1
       GROUP BY p.id
       ORDER BY p.id DESC
@@ -46,17 +53,18 @@ async function showCatalog(chatId) {
 
   const keyboard = result.rows.map((product) => {
     const stock = Number(product.stock);
-    const label = stock > 0
-      ? `${product.name} — ${product.price_rub} ₽`
-      : `${product.name} — нет в наличии`;
 
     return [{
-      text: label,
+      text: stock > 0
+        ? `${product.name} — ${product.price_rub} ₽ · ${stock} шт.`
+        : `${product.name} — нет в наличии`,
       callback_data: `product:${product.id}`
     }];
   });
 
-  keyboard.push([{ text: "⬅️ В меню", callback_data: "home" }]);
+  keyboard.push([
+    { text: "⬅️ В меню", callback_data: "home" }
+  ]);
 
   await sendMessage(
     chatId,
@@ -69,11 +77,16 @@ async function showProduct(chatId, productId) {
   const result = await db.execute({
     sql: `
       SELECT
-        p.id, p.name, p.country, p.protocol, p.price_rub,
+        p.id,
+        p.name,
+        p.country,
+        p.protocol,
+        p.price_rub,
         COUNT(c.id) AS stock
       FROM products p
       LEFT JOIN configs c
-        ON c.product_id = p.id AND c.status = 'available'
+        ON c.product_id = p.id
+        AND c.status = 'available'
       WHERE p.id = ? AND p.active = 1
       GROUP BY p.id
     `,
@@ -97,7 +110,7 @@ async function showProduct(chatId, productId) {
       `💰 Цена: ${product.price_rub} ₽\n` +
       `📦 В наличии: ${stock}\n\n` +
       (stock > 0
-        ? "Оформление покупки подключим следующим этапом."
+        ? "Покупка пока находится в разработке."
         : "К сожалению, конфиги закончились."),
     {
       inline_keyboard: [[
@@ -109,15 +122,17 @@ async function showProduct(chatId, productId) {
 
 async function showAdminInfo(chatId, telegramId) {
   if (!adminIds.has(String(telegramId))) {
-    await sendMessage(chatId, "⛔ Нет доступа к панели администратора.");
+    await sendMessage(
+      chatId,
+      "⛔ Нет доступа к панели администратора."
+    );
     return;
   }
 
   await sendMessage(
     chatId,
     "🛠 Админ-панель\n\n" +
-      "Следующим этапом подключим управление товарами, ценами, " +
-      "загрузкой конфигов и заказами."
+      "Управление товарами, конфигами и заказами добавим следующим этапом."
   );
 }
 
@@ -140,6 +155,8 @@ export default async function handler(req, res) {
   }
 
   try {
+    await initDatabase();
+
     const update = req.body;
 
     if (update?.message) {
@@ -189,15 +206,11 @@ export default async function handler(req, res) {
       if (data === "catalog" && chatId) {
         await showCatalog(chatId);
       } else if (data === "home" && chatId) {
-        await sendMessage(
-          chatId,
-          "🏠 Главное меню",
-          mainMenu()
-        );
+        await sendMessage(chatId, "🏠 Главное меню", mainMenu());
       } else if (data === "my_orders" && chatId) {
         await sendMessage(
           chatId,
-          "🧾 Раздел покупок подключим вместе с платёжным модулем."
+          "🧾 История покупок появится после подключения платежей."
         );
       } else if (data.startsWith("product:") && chatId) {
         const productId = Number(data.slice("product:".length));
@@ -213,6 +226,9 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error("Telegram webhook failed:", error);
-    return res.status(200).json({ ok: true });
+
+    // Telegram должен получить ошибку, чтобы обновление не считалось
+    // успешно обработанным. Не логируем токены или содержимое конфига.
+    return res.status(500).json({ ok: false });
   }
 }
