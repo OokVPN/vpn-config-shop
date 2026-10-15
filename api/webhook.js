@@ -1,7 +1,7 @@
-
 import { db, initDatabase } from "../src/db/client.js";
 
 import {
+  telegram,
   sendMessage,
   answerCallbackQuery
 } from "../src/bot/telegram.js";
@@ -16,13 +16,57 @@ const adminIds = new Set(
 function mainMenu() {
   return {
     inline_keyboard: [
-      [{ text: "🛒 Купить сервер", callback_data: "catalog" }],
-      [{ text: "👤 Моя покупка", callback_data: "my_orders" }]
+      [{ text: "🛒 Купить конфиг", callback_data: "catalog" }],
+      [{ text: "👤 Мои покупки", callback_data: "my_orders" }]
     ]
   };
 }
 
-async function showCatalog(chatId) {
+/**
+ * Редактирует текущее сообщение.
+ * Если Telegram сообщает, что текст не изменился,
+ * считаем это нормальной ситуацией.
+ */
+async function editMessage(chatId, messageId, text, replyMarkup) {
+  try {
+    return await telegram("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    });
+  } catch (error) {
+    if (String(error).includes("message is not modified")) {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Показывает экран:
+ * - редактирует сообщение, если передан messageId;
+ * - отправляет новое, если это команда из чата.
+ */
+async function render(chatId, messageId, text, keyboard) {
+  if (messageId) {
+    return editMessage(chatId, messageId, text, keyboard);
+  }
+
+  return sendMessage(chatId, text, keyboard);
+}
+
+async function showHome(chatId, messageId = null) {
+  await render(
+    chatId,
+    messageId,
+    "🚀 VPN Config Shop\n\nВыбирай, что тебя интересует:",
+    mainMenu()
+  );
+}
+
+async function showCatalog(chatId, messageId = null) {
   const result = await db.execute({
     sql: `
       SELECT
@@ -43,11 +87,17 @@ async function showCatalog(chatId) {
   });
 
   if (result.rows.length === 0) {
-    await sendMessage(
+    await render(
       chatId,
-      "📦 Пока товаров нет.\nЗагляни чуть позже!",
-      mainMenu()
+      messageId,
+      "🛒 Каталог\n\n📦 Пока товаров нет. Загляни позже!",
+      {
+        inline_keyboard: [
+          [{ text: "⬅️ В меню", callback_data: "home" }]
+        ]
+      }
     );
+
     return;
   }
 
@@ -66,14 +116,15 @@ async function showCatalog(chatId) {
     { text: "⬅️ В меню", callback_data: "home" }
   ]);
 
-  await sendMessage(
+  await render(
     chatId,
-    "🛒 Каталог серверов\n\nВыбери предложение:",
+    messageId,
+    "🛒 Каталог конфигов\n\nВыбери предложение:",
     { inline_keyboard: keyboard }
   );
 }
 
-async function showProduct(chatId, productId) {
+async function showProduct(chatId, productId, messageId = null) {
   const result = await db.execute({
     sql: `
       SELECT
@@ -96,43 +147,86 @@ async function showProduct(chatId, productId) {
   const product = result.rows[0];
 
   if (!product) {
-    await sendMessage(chatId, "Товар не найден или отключён.");
+    await render(
+      chatId,
+      messageId,
+      "❌ Товар не найден или больше не продаётся.",
+      {
+        inline_keyboard: [
+          [{ text: "⬅️ В каталог", callback_data: "catalog" }]
+        ]
+      }
+    );
+
     return;
   }
 
   const stock = Number(product.stock);
 
-  await sendMessage(
-    chatId,
+  const description =
     `🌐 ${product.name}\n\n` +
-      `🌍 Страна: ${product.country}\n` +
-      `🔌 Протокол: ${product.protocol}\n` +
-      `💰 Цена: ${product.price_rub} ₽\n` +
-      `📦 В наличии: ${stock}\n\n` +
-      (stock > 0
-        ? "Покупка пока находится в разработке."
-        : "К сожалению, конфиги закончились."),
+    `🌍 Страна: ${product.country}\n` +
+    `🔌 Протокол: ${product.protocol}\n` +
+    `💰 Цена: ${product.price_rub} ₽\n` +
+    `📦 В наличии: ${stock}\n\n` +
+    (
+      stock > 0
+        ? "🛠 Покупка пока находится в разработке."
+        : "😔 Конфиги закончились."
+    );
+
+  await render(
+    chatId,
+    messageId,
+    description,
     {
-      inline_keyboard: [[
-        { text: "⬅️ Назад в каталог", callback_data: "catalog" }
-      ]]
+      inline_keyboard: [
+        [{ text: "⬅️ Назад в каталог", callback_data: "catalog" }],
+        [{ text: "🏠 В меню", callback_data: "home" }]
+      ]
     }
   );
 }
 
-async function showAdminInfo(chatId, telegramId) {
+async function showMyOrders(chatId, messageId = null) {
+  await render(
+    chatId,
+    messageId,
+    "👤 Мои покупки\n\nИстория заказов появится после подключения оформления и оплаты.",
+    {
+      inline_keyboard: [
+        [{ text: "🛒 Каталог", callback_data: "catalog" }],
+        [{ text: "⬅️ В меню", callback_data: "home" }]
+      ]
+    }
+  );
+}
+
+async function showAdminInfo(chatId, telegramId, messageId = null) {
   if (!adminIds.has(String(telegramId))) {
-    await sendMessage(
+    await render(
       chatId,
-      "⛔ Нет доступа к панели администратора."
+      messageId,
+      "⛔ Нет доступа к панели администратора.",
+      {
+        inline_keyboard: [
+          [{ text: "⬅️ В меню", callback_data: "home" }]
+        ]
+      }
     );
+
     return;
   }
 
-  await sendMessage(
+  await render(
     chatId,
-    "🛠 Админ-панель\n\n" +
-      "Управление товарами, конфигами и заказами добавим следующим этапом."
+    messageId,
+    "🛠 Админ-панель\n\nУправление товарами, конфигами и заказами добавим следующим этапом.",
+    {
+      inline_keyboard: [
+        [{ text: "⬅️ В меню", callback_data: "home" }]
+      ]
+    }
   );
 }
 
@@ -159,6 +253,7 @@ export default async function handler(req, res) {
 
     const update = req.body;
 
+    // Обработка обычных сообщений и команд
     if (update?.message) {
       const message = update.message;
       const chatId = message.chat.id;
@@ -177,12 +272,7 @@ export default async function handler(req, res) {
       }
 
       if (text === "/start") {
-        await sendMessage(
-          chatId,
-          "🚀 Добро пожаловать в VPN Config Shop!\n\n" +
-            "Выбирай предложение в каталоге.",
-          mainMenu()
-        );
+        await showHome(chatId);
       } else if (text === "/catalog") {
         await showCatalog(chatId);
       } else if (text === "/admin") {
@@ -196,29 +286,47 @@ export default async function handler(req, res) {
       }
     }
 
+    // Обработка нажатий кнопок — без новых сообщений
     if (update?.callback_query) {
       const query = update.callback_query;
       const chatId = query.message?.chat?.id;
+      const messageId = query.message?.message_id;
+      const telegramId = query.from?.id;
       const data = query.data || "";
 
       await answerCallbackQuery(query.id);
 
-      if (data === "catalog" && chatId) {
-        await showCatalog(chatId);
-      } else if (data === "home" && chatId) {
-        await sendMessage(chatId, "🏠 Главное меню", mainMenu());
-      } else if (data === "my_orders" && chatId) {
-        await sendMessage(
-          chatId,
-          "🧾 История покупок появится после подключения платежей."
-        );
-      } else if (data.startsWith("product:") && chatId) {
-        const productId = Number(data.slice("product:".length));
+      if (chatId && messageId) {
+        if (data === "catalog") {
+          await showCatalog(chatId, messageId);
+        } else if (data === "home") {
+          await showHome(chatId, messageId);
+        } else if (data === "my_orders") {
+          await showMyOrders(chatId, messageId);
+        } else if (data === "admin") {
+          await showAdminInfo(chatId, telegramId, messageId);
+        } else if (data.startsWith("product:")) {
+          const productId = Number(
+            data.slice("product:".length)
+          );
 
-        if (Number.isSafeInteger(productId) && productId > 0) {
-          await showProduct(chatId, productId);
-        } else {
-          await sendMessage(chatId, "Некорректный товар.");
+          if (
+            Number.isSafeInteger(productId) &&
+            productId > 0
+          ) {
+            await showProduct(chatId, productId, messageId);
+          } else {
+            await editMessage(
+              chatId,
+              messageId,
+              "❌ Некорректный товар.",
+              {
+                inline_keyboard: [
+                  [{ text: "⬅️ В каталог", callback_data: "catalog" }]
+                ]
+              }
+            );
+          }
         }
       }
     }
@@ -226,9 +334,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (error) {
     console.error("Telegram webhook failed:", error);
-
-    // Telegram должен получить ошибку, чтобы обновление не считалось
-    // успешно обработанным. Не логируем токены или содержимое конфига.
     return res.status(500).json({ ok: false });
   }
 }
