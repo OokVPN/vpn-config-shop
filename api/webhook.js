@@ -9,7 +9,8 @@ import {
   createStarOrder,
   cancelStarOrder,
   validateStarPreCheckout,
-  processSuccessfulStarPayment
+  processSuccessfulStarPayment,
+  completeTestStarOrder
 } from "../src/payments/stars.js";
 
 const adminIds = new Set(
@@ -22,6 +23,10 @@ const adminIds = new Set(
 const MAX_CONFIGS_PER_UPLOAD = 500;
 const MAX_CONFIG_LENGTH = 4096;
 const MAX_STAR_PRICE = 100000;
+
+function isPaymentsTestMode() {
+  return String(process.env.PAYMENTS_TEST_MODE || "").toLowerCase() === "true";
+}
 
 const EDIT_FIELDS = {
   name: {
@@ -173,7 +178,8 @@ async function showAdminPanel(chatId, messageId) {
     messageId,
     "🛠 Админ-панель\n\n" +
       "Управляй товарами и складом конфигов.\n" +
-      "Покупатели оплачивают конфиги звёздами Telegram ⭐",
+      "Покупатели оплачивают конфиги звёздами Telegram ⭐" +
+      (isPaymentsTestMode() ? "\n\n🧪 ТЕСТОВЫЙ РЕЖИМ ВКЛЮЧЁН: тестовая выдача без списания звёзд доступна только администратору." : ""),
     adminKeyboard()
   );
 }
@@ -253,7 +259,7 @@ async function showCatalog(chatId, messageId = null) {
   );
 }
 
-async function showPublicProduct(chatId, productId, messageId) {
+async function showPublicProduct(chatId, productId, messageId, telegramId = null) {
   const result = await db.execute({
     sql: `SELECT p.*,
         (SELECT COUNT(*) FROM configs c
@@ -273,10 +279,16 @@ async function showPublicProduct(chatId, productId, messageId) {
 
   const stock = Number(product.stock);
   const keyboard = [];
-  if (stock > 0) {
+  if (stock > 0 && !isPaymentsTestMode()) {
     keyboard.push([{
       text: `⭐ Купить за ${product.price_stars} Stars`,
       callback_data: `buy:${product.id}`
+    }]);
+  }
+  if (stock > 0 && isPaymentsTestMode() && isAdmin(telegramId)) {
+    keyboard.push([{
+      text: "🧪 Тестовая выдача (без оплаты)",
+      callback_data: `testbuy:${product.id}`
     }]);
   }
   keyboard.push([{ text: "⬅️ Назад в каталог", callback_data: "catalog" }]);
@@ -290,18 +302,24 @@ async function showPublicProduct(chatId, productId, messageId) {
       `🔌 Протокол: ${product.protocol}\n` +
       `💰 Цена: ⭐ ${product.price_stars}\n` +
       `📦 В наличии: ${stock}\n\n` +
-      (stock > 0
-        ? "После успешной оплаты бот автоматически пришлёт один конфиг."
-        : "Сейчас конфигов нет в наличии."),
+      (stock <= 0
+        ? "Сейчас конфигов нет в наличии."
+        : isPaymentsTestMode()
+          ? (isAdmin(telegramId)
+            ? "🧪 Включён тестовый режим: реальная оплата отключена. Используй тестовую выдачу ниже."
+            : "⏸️ Магазин временно в режиме тестирования. Реальная оплата отключена.")
+          : "После успешной оплаты бот автоматически пришлёт один конфиг."),
     { inline_keyboard: keyboard }
   );
 }
 
 async function showMyOrders(chatId, messageId, telegramId) {
   const result = await db.execute({
-    sql: `SELECT o.id, o.amount_stars, o.status, o.created_at, p.name
+    sql: `SELECT o.id, o.amount_stars, o.status, o.created_at, p.name,
+        pay.status AS payment_status
       FROM orders o
       JOIN products p ON p.id = o.product_id
+      LEFT JOIN payments pay ON pay.order_id = o.id
       WHERE o.telegram_id = ?
       ORDER BY o.id DESC LIMIT 10`,
     args: [String(telegramId)]
@@ -323,10 +341,12 @@ async function showMyOrders(chatId, messageId, telegramId) {
     delivered: "✅ конфиг выдан",
     cancelled: "✖️ отменён"
   };
-  const text = result.rows.map((order) =>
-    `#${order.id} · ${order.name}\n⭐ ${order.amount_stars} · ` +
-    `${statusLabels[order.status] || order.status}\n${order.created_at}`
-  ).join("\n\n");
+  const text = result.rows.map((order) => {
+    const status = order.payment_status === "test"
+      ? "🧪 тестовая выдача (звёзды не списывались)"
+      : (statusLabels[order.status] || order.status);
+    return `#${order.id} · ${order.name}\n⭐ ${order.amount_stars} · ${status}\n${order.created_at}`;
+  }).join("\n\n");
 
   await render(chatId, messageId, `👤 Последние покупки\n\n${text}`, {
     inline_keyboard: [
@@ -767,6 +787,40 @@ async function notifyAdminsAboutPaidOrder(orderId, telegramId, stars) {
   }
 }
 
+async function handleTestPurchase(chatId, productId, telegramId) {
+  if (!isAdmin(telegramId) || !isPaymentsTestMode()) {
+    await sendMessage(chatId, "⛔ Тестовая выдача отключена или у тебя нет доступа.");
+    return;
+  }
+
+  let order;
+  try {
+    order = await createStarOrder(productId, telegramId);
+    const result = await completeTestStarOrder(order.orderId, telegramId);
+
+    if (!result.fulfilled || !result.configText) {
+      throw new Error("Не удалось завершить тестовую выдачу.");
+    }
+
+    await sendMessage(chatId,
+      `🧪 ТЕСТОВАЯ ПОКУПКА УСПЕШНА\n\n` +
+      `Заказ: #${result.orderId}\n` +
+      `Цена для проверки: ⭐ ${order.stars}\n` +
+      "Реальные звёзды НЕ списывались. Конфиг возвращён на склад после теста.");
+    await sendMessage(chatId, result.configText);
+  } catch (error) {
+    if (order?.orderId) {
+      try {
+        await cancelStarOrder(order.orderId);
+      } catch (cancelError) {
+        console.error("Could not release failed test order:", cancelError);
+      }
+    }
+    console.error("Test purchase failed:", error);
+    await sendMessage(chatId, "❌ Не удалось выполнить тест. Проверь, что товар активен и на складе есть конфиги.");
+  }
+}
+
 async function handleSuccessfulPayment(message) {
   const chatId = message.chat.id;
   const result = await processSuccessfulStarPayment(message);
@@ -931,7 +985,7 @@ export default async function handler(req, res) {
         await acceptTerms(telegramId);
         const productId = Number(data.split(":")[2]) || 0;
         if (productId > 0) {
-          await showPublicProduct(chatId, productId, messageId);
+          await showPublicProduct(chatId, productId, messageId, telegramId);
         } else {
           await showCatalog(chatId, messageId);
         }
@@ -940,11 +994,13 @@ export default async function handler(req, res) {
       } else if (data.startsWith("product:")) {
         const productId = Number(data.slice("product:".length));
         if (Number.isSafeInteger(productId) && productId > 0) {
-          await showPublicProduct(chatId, productId, messageId);
+          await showPublicProduct(chatId, productId, messageId, telegramId);
         }
       } else if (data.startsWith("buy:")) {
         const productId = Number(data.slice("buy:".length));
-        if (!Number.isSafeInteger(productId) || productId < 1) {
+        if (isPaymentsTestMode()) {
+          await sendMessage(chatId, "⏸️ Реальная оплата отключена на время тестирования. Звёзды не списываются.");
+        } else if (!Number.isSafeInteger(productId) || productId < 1) {
           await render(chatId, messageId, "❌ Товар не найден.", {
             inline_keyboard: [[{ text: "⬅️ К каталогу", callback_data: "catalog" }]]
           });
@@ -983,6 +1039,15 @@ export default async function handler(req, res) {
               console.error("Could not create Telegram Stars invoice:", error);
             }
           }
+        }
+      } else if (data.startsWith("testbuy:")) {
+        const productId = Number(data.slice("testbuy:".length));
+        if (!isAdmin(telegramId) || !isPaymentsTestMode()) {
+          await sendMessage(chatId, "⛔ Тестовая выдача отключена или у тебя нет доступа.");
+        } else if (!Number.isSafeInteger(productId) || productId < 1) {
+          await sendMessage(chatId, "❌ Товар не найден.");
+        } else {
+          await handleTestPurchase(chatId, productId, telegramId);
         }
       } else if (data === "admin:home") {
         await clearSession(telegramId);
@@ -1044,4 +1109,4 @@ export default async function handler(req, res) {
     console.error("Telegram webhook failed:", error);
     return res.status(500).json({ ok: false });
   }
-          }
+        }
