@@ -23,6 +23,7 @@ const adminIds = new Set(
 const MAX_CONFIGS_PER_UPLOAD = 500;
 const MAX_CONFIG_LENGTH = 4096;
 const MAX_STAR_PRICE = 100000;
+const TELEGRAM_MESSAGE_LIMIT = 4096;
 
 function isPaymentsTestMode() {
   return String(process.env.PAYMENTS_TEST_MODE || "").toLowerCase() === "true";
@@ -89,12 +90,13 @@ function adminKeyboard() {
   };
 }
 
-async function editMessage(chatId, messageId, text, replyMarkup) {
+async function editMessage(chatId, messageId, text, replyMarkup, parseMode) {
   try {
     return await telegram("editMessageText", {
       chat_id: chatId,
       message_id: messageId,
       text,
+      ...(parseMode ? { parse_mode: parseMode } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {})
     });
   } catch (error) {
@@ -106,6 +108,71 @@ async function editMessage(chatId, messageId, text, replyMarkup) {
 async function render(chatId, messageId, text, keyboard) {
   if (messageId) return editMessage(chatId, messageId, text, keyboard);
   return sendMessage(chatId, text, keyboard);
+}
+
+// The invoice is a separate Telegram service message, so save the product-card
+// message id to be able to replace that card after the payment succeeds.
+async function initCheckoutMessageStorage() {
+  await db.execute({
+    sql: `CREATE TABLE IF NOT EXISTS order_checkout_messages (
+      order_id INTEGER PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      message_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`
+  });
+}
+
+async function saveCheckoutMessage(orderId, chatId, messageId) {
+  await db.execute({
+    sql: `INSERT INTO order_checkout_messages (order_id, chat_id, message_id)
+      VALUES (?, ?, ?)
+      ON CONFLICT(order_id) DO UPDATE SET
+        chat_id = excluded.chat_id,
+        message_id = excluded.message_id`,
+    args: [Number(orderId), String(chatId), Number(messageId)]
+  });
+}
+
+async function getCheckoutMessage(orderId) {
+  const result = await db.execute({
+    sql: `SELECT chat_id, message_id
+      FROM order_checkout_messages WHERE order_id = ?`,
+    args: [Number(orderId)]
+  });
+  return result.rows[0] || null;
+}
+
+async function deleteCheckoutMessage(orderId) {
+  await db.execute({
+    sql: "DELETE FROM order_checkout_messages WHERE order_id = ?",
+    args: [Number(orderId)]
+  });
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function purchaseKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "🛒 В каталог", callback_data: "catalog" }],
+      [{ text: "🏠 В меню", callback_data: "home" }]
+    ]
+  };
+}
+
+async function sendHtmlMessage(chatId, text, replyMarkup) {
+  return telegram("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  });
 }
 
 async function saveSession(telegramId, action, data, chatId, messageId) {
@@ -787,7 +854,7 @@ async function notifyAdminsAboutPaidOrder(orderId, telegramId, stars) {
   }
 }
 
-async function handleTestPurchase(chatId, productId, telegramId) {
+async function handleTestPurchase(chatId, productId, telegramId, messageId = null) {
   if (!isAdmin(telegramId) || !isPaymentsTestMode()) {
     await sendMessage(chatId, "⛔ Тестовая выдача отключена или у тебя нет доступа.");
     return;
@@ -802,12 +869,36 @@ async function handleTestPurchase(chatId, productId, telegramId) {
       throw new Error("Не удалось завершить тестовую выдачу.");
     }
 
-    await sendMessage(chatId,
-      `🧪 ТЕСТОВАЯ ПОКУПКА УСПЕШНА\n\n` +
-      `Заказ: #${result.orderId}\n` +
+    const summary =
+      `🧪 <b>ТЕСТОВАЯ ПОКУПКА УСПЕШНА</b>\n\n` +
+      `Заказ: <b>#${result.orderId}</b>\n` +
       `Цена для проверки: ⭐ ${order.stars}\n` +
-      "Реальные звёзды НЕ списывались. Конфиг возвращён на склад после теста.");
-    await sendMessage(chatId, result.configText);
+      "Реальные звёзды НЕ списывались. Конфиг возвращён на склад после теста.";
+    const fullText = `${summary}\n\n<pre>${escapeHtml(result.configText)}</pre>`;
+    const canFitConfig = result.configText.length + summary.length + 20 <= TELEGRAM_MESSAGE_LIMIT;
+    let edited = false;
+
+    if (messageId) {
+      try {
+        await editMessage(
+          chatId,
+          messageId,
+          canFitConfig ? fullText : summary,
+          purchaseKeyboard(),
+          "HTML"
+        );
+        edited = true;
+      } catch (error) {
+        console.error("Could not edit test purchase product card:", error);
+      }
+    }
+
+    if (!edited) {
+      await sendHtmlMessage(chatId, canFitConfig ? fullText : summary, purchaseKeyboard());
+    }
+    if (!canFitConfig) {
+      await sendHtmlMessage(chatId, `<pre>${escapeHtml(result.configText)}</pre>`);
+    }
   } catch (error) {
     if (order?.orderId) {
       try {
@@ -837,10 +928,55 @@ async function handleSuccessfulPayment(message) {
     return;
   }
 
-  await sendMessage(chatId,
-    `✅ Оплата получена! Заказ #${result.orderId} выполнен.\n\nТвой конфиг отправляю следующим сообщением.`);
-  // Send the URI separately so its full length fits Telegram's message limit.
-  await sendMessage(chatId, result.configText);
+  const stars = Number(message.successful_payment?.total_amount || 0);
+  const summary =
+    `✅ <b>Оплата прошла успешно!</b>\n\n` +
+    `Заказ: <b>#${result.orderId}</b>\n` +
+    `Оплачено: <b>⭐ ${stars}</b>`;
+  const configBlock = `<pre>${escapeHtml(result.configText)}</pre>`;
+  const fullText = `${summary}\n\nТвой VPN-конфиг:\n${configBlock}`;
+  // Telegram has a 4096-character post-parse limit. Very long configs are sent
+  // in their own code block while the original product card becomes the receipt.
+  const canFitConfig = result.configText.length + summary.length + 40 <= TELEGRAM_MESSAGE_LIMIT;
+  const cardText = canFitConfig ? fullText : summary;
+  const keyboard = purchaseKeyboard();
+  let checkout = null;
+
+  try {
+    checkout = await getCheckoutMessage(result.orderId);
+  } catch (error) {
+    console.error("Could not load checkout product card:", error);
+  }
+
+  let edited = false;
+  if (checkout?.message_id) {
+    try {
+      await editMessage(
+        checkout.chat_id || chatId,
+        Number(checkout.message_id),
+        cardText,
+        keyboard,
+        "HTML"
+      );
+      edited = true;
+    } catch (error) {
+      console.error("Could not edit product card after payment:", error);
+    }
+  }
+
+  if (!edited) {
+    await sendHtmlMessage(chatId, cardText, keyboard);
+  }
+
+  if (!canFitConfig) {
+    await sendHtmlMessage(chatId, configBlock);
+  }
+
+  try {
+    await deleteCheckoutMessage(result.orderId);
+  } catch (error) {
+    console.error("Could not delete checkout message mapping:", error);
+  }
 }
 
 export default async function handler(req, res) {
@@ -857,6 +993,7 @@ export default async function handler(req, res) {
 
   try {
     await initDatabase();
+    await initCheckoutMessageStorage();
     const update = req.body;
 
     if (update?.pre_checkout_query) {
@@ -1010,6 +1147,7 @@ export default async function handler(req, res) {
           let order;
           try {
             order = await createStarOrder(productId, telegramId);
+            await saveCheckoutMessage(order.orderId, chatId, messageId);
             await telegram("sendInvoice", {
               chat_id: chatId,
               title: order.productName.slice(0, 32) || "VPN-конфиг",
@@ -1024,6 +1162,7 @@ export default async function handler(req, res) {
             if (order?.orderId) {
               try {
                 await cancelStarOrder(order.orderId);
+                await deleteCheckoutMessage(order.orderId);
               } catch (cancelError) {
                 console.error("Could not release failed Stars order:", cancelError);
               }
@@ -1047,7 +1186,7 @@ export default async function handler(req, res) {
         } else if (!Number.isSafeInteger(productId) || productId < 1) {
           await sendMessage(chatId, "❌ Товар не найден.");
         } else {
-          await handleTestPurchase(chatId, productId, telegramId);
+          await handleTestPurchase(chatId, productId, telegramId, messageId);
         }
       } else if (data === "admin:home") {
         await clearSession(telegramId);
@@ -1109,4 +1248,4 @@ export default async function handler(req, res) {
     console.error("Telegram webhook failed:", error);
     return res.status(500).json({ ok: false });
   }
-        }
+    }
