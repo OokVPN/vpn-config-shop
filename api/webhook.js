@@ -1,9 +1,11 @@
+
 import { db, initDatabase } from "../src/db/client.js";
 
 import {
   telegram,
   sendMessage,
-  answerCallbackQuery
+  answerCallbackQuery,
+  downloadTelegramFile
 } from "../src/bot/telegram.js";
 
 const adminIds = new Set(
@@ -13,20 +15,70 @@ const adminIds = new Set(
     .filter(Boolean)
 );
 
-function mainMenu() {
+const MAX_CONFIGS_PER_UPLOAD = 500;
+const MAX_CONFIG_LENGTH = 4096;
+
+const EDIT_FIELDS = {
+  name: {
+    column: "name",
+    label: "название",
+    prompt: "Введи новое название товара:"
+  },
+  country: {
+    column: "country",
+    label: "страну",
+    prompt: "Введи новую страну:"
+  },
+  protocol: {
+    column: "protocol",
+    label: "протокол",
+    prompt: "Введи новый протокол:"
+  },
+  price: {
+    column: "price_rub",
+    label: "цену",
+    prompt: "Введи новую цену в целых рублях:"
+  }
+};
+
+function isAdmin(telegramId) {
+  return adminIds.has(String(telegramId));
+}
+
+function mainMenu(telegramId) {
+  const rows = [
+    [{ text: "🛒 Купить конфиг", callback_data: "catalog" }],
+    [{ text: "👤 Мои покупки", callback_data: "my_orders" }]
+  ];
+
+  if (isAdmin(telegramId)) {
+    rows.push([
+      { text: "🛠 Админ-панель", callback_data: "admin:home" }
+    ]);
+  }
+
+  return { inline_keyboard: rows };
+}
+
+function cancelKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: "🛒 Купить конфиг", callback_data: "catalog" }],
-      [{ text: "👤 Мои покупки", callback_data: "my_orders" }]
+      [{ text: "✖️ Отмена", callback_data: "admin:cancel" }]
     ]
   };
 }
 
-/**
- * Редактирует текущее сообщение.
- * Если Telegram сообщает, что текст не изменился,
- * считаем это нормальной ситуацией.
- */
+function adminKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "➕ Создать товар", callback_data: "admin:new" }],
+      [{ text: "📝 Управление товарами", callback_data: "admin:products" }],
+      [{ text: "📦 Склад конфигов", callback_data: "admin:stock" }],
+      [{ text: "🏠 Главное меню", callback_data: "home" }]
+    ]
+  };
+}
+
 async function editMessage(chatId, messageId, text, replyMarkup) {
   try {
     return await telegram("editMessageText", {
@@ -44,11 +96,6 @@ async function editMessage(chatId, messageId, text, replyMarkup) {
   }
 }
 
-/**
- * Показывает экран:
- * - редактирует сообщение, если передан messageId;
- * - отправляет новое, если это команда из чата.
- */
 async function render(chatId, messageId, text, keyboard) {
   if (messageId) {
     return editMessage(chatId, messageId, text, keyboard);
@@ -57,12 +104,83 @@ async function render(chatId, messageId, text, keyboard) {
   return sendMessage(chatId, text, keyboard);
 }
 
-async function showHome(chatId, messageId = null) {
+async function saveSession(telegramId, action, data, chatId, messageId) {
+  await db.execute({
+    sql: `
+      INSERT INTO admin_sessions
+        (telegram_id, action, data_json, chat_id, message_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        action = excluded.action,
+        data_json = excluded.data_json,
+        chat_id = excluded.chat_id,
+        message_id = excluded.message_id,
+        updated_at = datetime('now')
+    `,
+    args: [
+      String(telegramId),
+      action,
+      JSON.stringify(data || {}),
+      String(chatId),
+      Number(messageId)
+    ]
+  });
+}
+
+async function getSession(telegramId) {
+  const result = await db.execute({
+    sql: `
+      SELECT action, data_json, chat_id, message_id
+      FROM admin_sessions
+      WHERE telegram_id = ?
+    `,
+    args: [String(telegramId)]
+  });
+
+  const row = result.rows[0];
+
+  if (!row) return null;
+
+  let data = {};
+
+  try {
+    data = JSON.parse(row.data_json || "{}");
+  } catch {
+    data = {};
+  }
+
+  return {
+    action: row.action,
+    data,
+    chatId: row.chat_id,
+    messageId: Number(row.message_id)
+  };
+}
+
+async function clearSession(telegramId) {
+  await db.execute({
+    sql: "DELETE FROM admin_sessions WHERE telegram_id = ?",
+    args: [String(telegramId)]
+  });
+}
+
+async function showHome(chatId, messageId, telegramId) {
   await render(
     chatId,
     messageId,
-    "🚀 VPN Config Shop\n\nВыбирай, что тебя интересует:",
-    mainMenu()
+    "🚀 VPN Config Shop\n\nВыбирай нужный раздел:",
+    mainMenu(telegramId)
+  );
+}
+
+async function showAdminPanel(chatId, messageId) {
+  await render(
+    chatId,
+    messageId,
+    "🛠 Админ-панель\n\n" +
+      "Управляй товарами и складом конфигов.\n\n" +
+      "Оплата пока не подключена.",
+    adminKeyboard()
   );
 }
 
@@ -72,8 +190,6 @@ async function showCatalog(chatId, messageId = null) {
       SELECT
         p.id,
         p.name,
-        p.country,
-        p.protocol,
         p.price_rub,
         COUNT(c.id) AS stock
       FROM products p
@@ -86,11 +202,11 @@ async function showCatalog(chatId, messageId = null) {
     `
   });
 
-  if (result.rows.length === 0) {
+  if (!result.rows.length) {
     await render(
       chatId,
       messageId,
-      "🛒 Каталог\n\n📦 Пока товаров нет. Загляни позже!",
+      "🛒 Каталог\n\n📦 Пока товаров нет.",
       {
         inline_keyboard: [
           [{ text: "⬅️ В меню", callback_data: "home" }]
@@ -101,14 +217,14 @@ async function showCatalog(chatId, messageId = null) {
     return;
   }
 
-  const keyboard = result.rows.map((product) => {
-    const stock = Number(product.stock);
+  const keyboard = result.rows.map((p) => {
+    const stock = Number(p.stock);
 
     return [{
       text: stock > 0
-        ? `${product.name} — ${product.price_rub} ₽ · ${stock} шт.`
-        : `${product.name} — нет в наличии`,
-      callback_data: `product:${product.id}`
+        ? `${p.name} — ${p.price_rub} ₽ · ${stock} шт.`
+        : `${p.name} — нет в наличии`,
+      callback_data: `product:${p.id}`
     }];
   });
 
@@ -124,33 +240,25 @@ async function showCatalog(chatId, messageId = null) {
   );
 }
 
-async function showProduct(chatId, productId, messageId = null) {
+async function showPublicProduct(chatId, productId, messageId) {
   const result = await db.execute({
     sql: `
-      SELECT
-        p.id,
-        p.name,
-        p.country,
-        p.protocol,
-        p.price_rub,
-        COUNT(c.id) AS stock
+      SELECT p.*,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'available') AS stock
       FROM products p
-      LEFT JOIN configs c
-        ON c.product_id = p.id
-        AND c.status = 'available'
       WHERE p.id = ? AND p.active = 1
-      GROUP BY p.id
     `,
     args: [productId]
   });
 
-  const product = result.rows[0];
+  const p = result.rows[0];
 
-  if (!product) {
+  if (!p) {
     await render(
       chatId,
       messageId,
-      "❌ Товар не найден или больше не продаётся.",
+      "❌ Товар не найден или отключён.",
       {
         inline_keyboard: [
           [{ text: "⬅️ В каталог", callback_data: "catalog" }]
@@ -161,24 +269,15 @@ async function showProduct(chatId, productId, messageId = null) {
     return;
   }
 
-  const stock = Number(product.stock);
-
-  const description =
-    `🌐 ${product.name}\n\n` +
-    `🌍 Страна: ${product.country}\n` +
-    `🔌 Протокол: ${product.protocol}\n` +
-    `💰 Цена: ${product.price_rub} ₽\n` +
-    `📦 В наличии: ${stock}\n\n` +
-    (
-      stock > 0
-        ? "🛠 Покупка пока находится в разработке."
-        : "😔 Конфиги закончились."
-    );
-
   await render(
     chatId,
     messageId,
-    description,
+    `🌐 ${p.name}\n\n` +
+      `🌍 Страна: ${p.country}\n` +
+      `🔌 Протокол: ${p.protocol}\n` +
+      `💰 Цена: ${p.price_rub} ₽\n` +
+      `📦 В наличии: ${Number(p.stock)}\n\n` +
+      "Покупка и оплата будут доступны после подключения платежей.",
     {
       inline_keyboard: [
         [{ text: "⬅️ Назад в каталог", callback_data: "catalog" }],
@@ -188,29 +287,86 @@ async function showProduct(chatId, productId, messageId = null) {
   );
 }
 
-async function showMyOrders(chatId, messageId = null) {
-  await render(
-    chatId,
-    messageId,
-    "👤 Мои покупки\n\nИстория заказов появится после подключения оформления и оплаты.",
-    {
-      inline_keyboard: [
-        [{ text: "🛒 Каталог", callback_data: "catalog" }],
-        [{ text: "⬅️ В меню", callback_data: "home" }]
-      ]
-    }
-  );
-}
+async function showAdminProducts(chatId, messageId) {
+  const result = await db.execute({
+    sql: `
+      SELECT
+        p.id, p.name, p.price_rub, p.active,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'available') AS stock
+      FROM products p
+      ORDER BY p.id DESC
+    `
+  });
 
-async function showAdminInfo(chatId, telegramId, messageId = null) {
-  if (!adminIds.has(String(telegramId))) {
+  if (!result.rows.length) {
     await render(
       chatId,
       messageId,
-      "⛔ Нет доступа к панели администратора.",
+      "📝 Товаров пока нет. Создай первый товар!",
       {
         inline_keyboard: [
-          [{ text: "⬅️ В меню", callback_data: "home" }]
+          [{ text: "➕ Создать товар", callback_data: "admin:new" }],
+          [{ text: "⬅️ В админку", callback_data: "admin:home" }]
+        ]
+      }
+    );
+
+    return;
+  }
+
+  const keyboard = result.rows.map((p) => [{
+    text:
+      `${p.active ? "🟢" : "⚪"} ${p.name} · ${p.price_rub} ₽ · ${Number(p.stock)} шт.`,
+    callback_data: `admin:product:${p.id}`
+  }]);
+
+  keyboard.push([
+    { text: "➕ Создать товар", callback_data: "admin:new" }
+  ]);
+  keyboard.push([
+    { text: "⬅️ В админку", callback_data: "admin:home" }
+  ]);
+
+  await render(
+    chatId,
+    messageId,
+    "📝 Управление товарами\n\n" +
+      "🟢 — активен\n⚪ — отключён\n\nВыбери товар:",
+    { inline_keyboard: keyboard }
+  );
+}
+
+async function getAdminProduct(productId) {
+  const result = await db.execute({
+    sql: `
+      SELECT p.*,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'available') AS available_stock,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'sold') AS sold_stock,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'reserved') AS reserved_stock
+      FROM products p
+      WHERE p.id = ?
+    `,
+    args: [productId]
+  });
+
+  return result.rows[0] || null;
+}
+
+async function showAdminProduct(chatId, messageId, productId) {
+  const p = await getAdminProduct(productId);
+
+  if (!p) {
+    await render(
+      chatId,
+      messageId,
+      "❌ Товар не найден.",
+      {
+        inline_keyboard: [
+          [{ text: "⬅️ К товарам", callback_data: "admin:products" }]
         ]
       }
     );
@@ -221,13 +377,515 @@ async function showAdminInfo(chatId, telegramId, messageId = null) {
   await render(
     chatId,
     messageId,
-    "🛠 Админ-панель\n\nУправление товарами, конфигами и заказами добавим следующим этапом.",
+    `📝 Товар #${p.id}\n\n` +
+      `Название: ${p.name}\n` +
+      `Страна: ${p.country}\n` +
+      `Протокол: ${p.protocol}\n` +
+      `Цена: ${p.price_rub} ₽\n` +
+      `Статус: ${p.active ? "🟢 активен" : "⚪ отключён"}\n\n` +
+      `📦 В наличии: ${Number(p.available_stock)}\n` +
+      `🧾 Продано: ${Number(p.sold_stock)}\n` +
+      `⏳ Зарезервировано: ${Number(p.reserved_stock)}`,
     {
       inline_keyboard: [
-        [{ text: "⬅️ В меню", callback_data: "home" }]
+        [
+          { text: "✏️ Название", callback_data: `admin:edit:${p.id}:name` },
+          { text: "🌍 Страна", callback_data: `admin:edit:${p.id}:country` }
+        ],
+        [
+          { text: "🔌 Протокол", callback_data: `admin:edit:${p.id}:protocol` },
+          { text: "💰 Цена", callback_data: `admin:edit:${p.id}:price` }
+        ],
+        [{ text: "📥 Добавить конфиги", callback_data: `admin:addstock:${p.id}` }],
+        [{ text: "📦 Управление складом", callback_data: `admin:stockprod:${p.id}` }],
+        [{
+          text: p.active ? "⏸ Отключить товар" : "▶️ Включить товар",
+          callback_data: `admin:toggle:${p.id}`
+        }],
+        [{ text: "⬅️ К товарам", callback_data: "admin:products" }],
+        [{ text: "🏠 В админку", callback_data: "admin:home" }]
       ]
     }
   );
+}
+
+async function showStock(chatId, messageId) {
+  const result = await db.execute({
+    sql: `
+      SELECT
+        p.id, p.name, p.active,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'available') AS available_stock,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'sold') AS sold_stock,
+        (SELECT COUNT(*) FROM configs c
+          WHERE c.product_id = p.id AND c.status = 'reserved') AS reserved_stock
+      FROM products p
+      ORDER BY p.id DESC
+    `
+  });
+
+  if (!result.rows.length) {
+    await render(
+      chatId,
+      messageId,
+      "📦 Склад пуст — сначала создай товар.",
+      {
+        inline_keyboard: [
+          [{ text: "➕ Создать товар", callback_data: "admin:new" }],
+          [{ text: "⬅️ В админку", callback_data: "admin:home" }]
+        ]
+      }
+    );
+
+    return;
+  }
+
+  const keyboard = result.rows.map((p) => [{
+    text: `${p.name} · ${Number(p.available_stock)} доступно`,
+    callback_data: `admin:stockprod:${p.id}`
+  }]);
+
+  keyboard.push([
+    { text: "⬅️ В админку", callback_data: "admin:home" }
+  ]);
+
+  const summary = result.rows.map((p) =>
+    `${p.name}\n` +
+    `  Доступно: ${Number(p.available_stock)} · ` +
+    `Продано: ${Number(p.sold_stock)} · ` +
+    `Резерв: ${Number(p.reserved_stock)}`
+  ).join("\n\n");
+
+  await render(
+    chatId,
+    messageId,
+    `📦 Склад конфигов\n\n${summary}\n\nВыбери товар для подробностей:`,
+    { inline_keyboard: keyboard }
+  );
+}
+
+async function showStockProduct(chatId, messageId, productId) {
+  const p = await getAdminProduct(productId);
+
+  if (!p) {
+    await showStock(chatId, messageId);
+    return;
+  }
+
+  await render(
+    chatId,
+    messageId,
+    `📦 Склад: ${p.name}\n\n` +
+      `Доступно: ${Number(p.available_stock)}\n` +
+      `Продано: ${Number(p.sold_stock)}\n` +
+      `Зарезервировано: ${Number(p.reserved_stock)}\n\n` +
+      "Добавление конфигов поддерживает текстовые URI и файлы .txt.",
+    {
+      inline_keyboard: [
+        [{ text: "📥 Добавить конфиги", callback_data: `admin:addstock:${p.id}` }],
+        [{ text: "📝 Карточка товара", callback_data: `admin:product:${p.id}` }],
+        [{ text: "⬅️ К складу", callback_data: "admin:stock" }],
+        [{ text: "🏠 В админку", callback_data: "admin:home" }]
+      ]
+    }
+  );
+}
+
+async function beginSession(
+  telegramId,
+  chatId,
+  messageId,
+  action,
+  data,
+  prompt
+) {
+  await saveSession(telegramId, action, data, chatId, messageId);
+  await editMessage(chatId, messageId, prompt, cancelKeyboard());
+}
+
+async function beginStockUpload(telegramId, chatId, messageId, productId) {
+  const p = await getAdminProduct(productId);
+
+  if (!p) {
+    await render(
+      chatId,
+      messageId,
+      "❌ Товар не найден.",
+      {
+        inline_keyboard: [
+          [{ text: "⬅️ К складу", callback_data: "admin:stock" }]
+        ]
+      }
+    );
+
+    return;
+  }
+
+  await beginSession(
+    telegramId,
+    chatId,
+    messageId,
+    "add_stock",
+    { productId },
+    `📥 Загрузка конфигов: ${p.name}\n\n` +
+      "Отправь один или несколько URI текстом, каждый с новой строки, " +
+      "либо отправь файл .txt.\n\n" +
+      "Поддерживаются VLESS, VMess, Trojan, Shadowsocks, SOCKS и Hysteria.\n" +
+      "Пустые строки и строки-комментарии, начинающиеся с #, игнорируются.\n\n" +
+      "Максимум за одну загрузку: 500 конфигов."
+  );
+}
+
+function parseConfigLines(content) {
+  return content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+}
+
+function isValidConfigUri(value) {
+  return value.length <= MAX_CONFIG_LENGTH &&
+    /^(vless|vmess|trojan|ss|socks|socks5|hysteria|hysteria2|hy2):\/\/\S+$/i.test(value);
+}
+
+async function importConfigs(productId, content) {
+  const lines = parseConfigLines(content);
+
+  if (!lines.length) {
+    return {
+      inserted: 0,
+      duplicates: 0,
+      invalid: 0,
+      message: "Файл или сообщение не содержит конфигов."
+    };
+  }
+
+  if (lines.length > MAX_CONFIGS_PER_UPLOAD) {
+    throw new Error(
+      `Слишком много строк: максимум ${MAX_CONFIGS_PER_UPLOAD} конфигов за загрузку.`
+    );
+  }
+
+  const productResult = await db.execute({
+    sql: "SELECT id FROM products WHERE id = ?",
+    args: [productId]
+  });
+
+  if (!productResult.rows.length) {
+    throw new Error("Товар не найден.");
+  }
+
+  let inserted = 0;
+  let duplicates = 0;
+  let invalid = 0;
+
+  const seen = new Set();
+
+  for (const config of lines) {
+    if (!isValidConfigUri(config)) {
+      invalid++;
+      continue;
+    }
+
+    if (seen.has(config)) {
+      duplicates++;
+      continue;
+    }
+
+    seen.add(config);
+
+    const existing = await db.execute({
+      sql: "SELECT id FROM configs WHERE config_text = ? LIMIT 1",
+      args: [config]
+    });
+
+    if (existing.rows.length) {
+      duplicates++;
+      continue;
+    }
+
+    await db.execute({
+      sql: `
+        INSERT INTO configs (product_id, config_text, status)
+        VALUES (?, ?, 'available')
+      `,
+      args: [productId, config]
+    });
+
+    inserted++;
+  }
+
+  return { inserted, duplicates, invalid };
+}
+
+async function handleAdminInput(message, session) {
+  const telegramId = message.from.id;
+  const chatId = session.chatId;
+  const messageId = session.messageId;
+  const text = (message.text || "").trim();
+  const data = session.data || {};
+
+  if (session.action === "add_stock") {
+    let content;
+
+    if (message.document) {
+      const doc = message.document;
+      const filename = (doc.file_name || "").toLowerCase();
+
+      if (
+        !filename.endsWith(".txt") &&
+        doc.mime_type !== "text/plain"
+      ) {
+        await editMessage(
+          chatId,
+          messageId,
+          "❌ Отправь текстовый файл .txt или вставь URI сообщением.",
+          cancelKeyboard()
+        );
+        return;
+      }
+
+      try {
+        content = await downloadTelegramFile(doc.file_id);
+      } catch (error) {
+        await editMessage(
+          chatId,
+          messageId,
+          `❌ Не удалось прочитать файл: ${error.message}\n\nПопробуй ещё раз.`,
+          cancelKeyboard()
+        );
+        return;
+      }
+    } else if (text) {
+      content = text;
+    } else {
+      await editMessage(
+        chatId,
+        messageId,
+        "Отправь URI текстом или файл .txt.",
+        cancelKeyboard()
+      );
+      return;
+    }
+
+    try {
+      const result = await importConfigs(data.productId, content);
+
+      await clearSession(telegramId);
+
+      const summary =
+        `✅ Загрузка завершена\n\n` +
+        `Добавлено: ${result.inserted}\n` +
+        `Дубликатов: ${result.duplicates}\n` +
+        `Некорректных строк: ${result.invalid}` +
+        (result.message ? `\n\n${result.message}` : "");
+
+      await render(
+        chatId,
+        messageId,
+        summary,
+        {
+          inline_keyboard: [
+            [{
+              text: "📥 Добавить ещё",
+              callback_data: `admin:addstock:${data.productId}`
+            }],
+            [{
+              text: "📦 К складу товара",
+              callback_data: `admin:stockprod:${data.productId}`
+            }],
+            [{
+              text: "🛠 В админку",
+              callback_data: "admin:home"
+            }]
+          ]
+        }
+      );
+    } catch (error) {
+      await editMessage(
+        chatId,
+        messageId,
+        `❌ Ошибка загрузки: ${error.message}\n\nПопробуй ещё раз.`,
+        cancelKeyboard()
+      );
+    }
+
+    return;
+  }
+
+  if (message.document) {
+    await editMessage(
+      chatId,
+      messageId,
+      "Для этого шага нужен текст. Отправь значение сообщением.",
+      cancelKeyboard()
+    );
+    return;
+  }
+
+  if (!text) {
+    await editMessage(
+      chatId,
+      messageId,
+      "Отправь значение текстом.",
+      cancelKeyboard()
+    );
+    return;
+  }
+
+  if (session.action === "create_name") {
+    if (text.length > 80) {
+      await editMessage(chatId, messageId, "Название слишком длинное. Максимум 80 символов.", cancelKeyboard());
+      return;
+    }
+
+    await saveSession(telegramId, "create_country", { name: text }, chatId, messageId);
+    await editMessage(chatId, messageId, "🌍 Введи страну сервера:", cancelKeyboard());
+    return;
+  }
+
+  if (session.action === "create_country") {
+    if (text.length > 60) {
+      await editMessage(chatId, messageId, "Название страны слишком длинное. Максимум 60 символов.", cancelKeyboard());
+      return;
+    }
+
+    await saveSession(
+      telegramId,
+      "create_protocol",
+      { ...data, country: text },
+      chatId,
+      messageId
+    );
+
+    await editMessage(
+      chatId,
+      messageId,
+      "🔌 Введи название протокола (например, VLESS Reality):",
+      cancelKeyboard()
+    );
+    return;
+  }
+
+  if (session.action === "create_protocol") {
+    if (text.length > 40) {
+      await editMessage(chatId, messageId, "Название протокола слишком длинное. Максимум 40 символов.", cancelKeyboard());
+      return;
+    }
+
+    await saveSession(
+      telegramId,
+      "create_price",
+      { ...data, protocol: text },
+      chatId,
+      messageId
+    );
+
+    await editMessage(
+      chatId,
+      messageId,
+      "💰 Введи цену в целых рублях, например 19:",
+      cancelKeyboard()
+    );
+    return;
+  }
+
+  if (session.action === "create_price") {
+    const price = Number(text);
+
+    if (!Number.isSafeInteger(price) || price < 1 || price > 1_000_000) {
+      await editMessage(
+        chatId,
+        messageId,
+        "❌ Цена должна быть целым числом от 1 до 1 000 000 ₽. Попробуй ещё раз:",
+        cancelKeyboard()
+      );
+      return;
+    }
+
+    const result = await db.execute({
+      sql: `
+        INSERT INTO products (name, country, protocol, price_rub, active)
+        VALUES (?, ?, ?, ?, 1)
+      `,
+      args: [data.name, data.country, data.protocol, price]
+    });
+
+    const productId = Number(result.lastInsertRowid);
+
+    await clearSession(telegramId);
+
+    await render(
+      chatId,
+      messageId,
+      `✅ Товар создан!\n\n` +
+        `Название: ${data.name}\n` +
+        `Страна: ${data.country}\n` +
+        `Протокол: ${data.protocol}\n` +
+        `Цена: ${price} ₽\n\n` +
+        "Теперь можно загрузить конфиги на склад.",
+      {
+        inline_keyboard: [
+          [{
+            text: "📥 Добавить конфиги",
+            callback_data: `admin:addstock:${productId}`
+          }],
+          [{
+            text: "📝 Открыть товар",
+            callback_data: `admin:product:${productId}`
+          }],
+          [{
+            text: "🛠 В админку",
+            callback_data: "admin:home"
+          }]
+        ]
+      }
+    );
+    return;
+  }
+
+  if (session.action === "edit_product") {
+    const field = EDIT_FIELDS[data.field];
+
+    if (!field) {
+      await clearSession(telegramId);
+      await showAdminPanel(chatId, messageId);
+      return;
+    }
+
+    let value = text;
+
+    if (data.field === "price") {
+      value = Number(text);
+
+      if (!Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {
+        await editMessage(
+          chatId,
+          messageId,
+          "❌ Цена должна быть целым числом от 1 до 1 000 000 ₽. Попробуй ещё раз:",
+          cancelKeyboard()
+        );
+        return;
+      }
+    } else if (text.length > (data.field === "name" ? 80 : 60)) {
+      await editMessage(
+        chatId,
+        messageId,
+        "❌ Значение слишком длинное. Попробуй ещё раз:",
+        cancelKeyboard()
+      );
+      return;
+    }
+
+    await db.execute({
+      sql: `UPDATE products SET ${field.column} = ? WHERE id = ?`,
+      args: [value, data.productId]
+    });
+
+    await clearSession(telegramId);
+    await showAdminProduct(chatId, messageId, data.productId);
+  }
 }
 
 export default async function handler(req, res) {
@@ -237,8 +895,7 @@ export default async function handler(req, res) {
   }
 
   const secret = process.env.WEBHOOK_SECRET;
-  const receivedSecret =
-    req.headers["x-telegram-bot-api-secret-token"];
+  const receivedSecret = req.headers["x-telegram-bot-api-secret-token"];
 
   if (
     !secret ||
@@ -253,7 +910,6 @@ export default async function handler(req, res) {
 
     const update = req.body;
 
-    // Обработка обычных сообщений и команд
     if (update?.message) {
       const message = update.message;
       const chatId = message.chat.id;
@@ -271,22 +927,60 @@ export default async function handler(req, res) {
         });
       }
 
-      if (text === "/start") {
-        await showHome(chatId);
+      if (text === "/cancel") {
+        if (telegramId && isAdmin(telegramId)) {
+          const session = await getSession(telegramId);
+
+          await clearSession(telegramId);
+
+          if (session) {
+            await showAdminPanel(session.chatId, session.messageId);
+          } else {
+            await showAdminPanel(chatId, null);
+          }
+        } else {
+          await sendMessage(chatId, "Нет активной операции.", mainMenu(telegramId));
+        }
+      } else if (text === "/start") {
+        if (telegramId && isAdmin(telegramId)) {
+          await clearSession(telegramId);
+        }
+
+        await showHome(chatId, null, telegramId);
       } else if (text === "/catalog") {
+        if (telegramId && isAdmin(telegramId)) {
+          await clearSession(telegramId);
+        }
+
         await showCatalog(chatId);
       } else if (text === "/admin") {
-        await showAdminInfo(chatId, telegramId);
+        if (!isAdmin(telegramId)) {
+          await sendMessage(chatId, "⛔ Нет доступа к админ-панели.");
+        } else {
+          await clearSession(telegramId);
+          await showAdminPanel(chatId, null);
+        }
+      } else if (telegramId && isAdmin(telegramId)) {
+        const session = await getSession(telegramId);
+
+        if (session) {
+          await handleAdminInput(message, session);
+        } else {
+          await sendMessage(
+            chatId,
+            "Используй меню ниже 👇",
+            mainMenu(telegramId)
+          );
+        }
       } else {
         await sendMessage(
           chatId,
           "Используй меню ниже 👇",
-          mainMenu()
+          mainMenu(telegramId)
         );
       }
     }
 
-    // Обработка нажатий кнопок — без новых сообщений
     if (update?.callback_query) {
       const query = update.callback_query;
       const chatId = query.message?.chat?.id;
@@ -294,39 +988,123 @@ export default async function handler(req, res) {
       const telegramId = query.from?.id;
       const data = query.data || "";
 
+      if (data.startsWith("admin:") && !isAdmin(telegramId)) {
+        await answerCallbackQuery(query.id, "⛔ Нет доступа.");
+        return res.status(200).json({ ok: true });
+      }
+
       await answerCallbackQuery(query.id);
 
-      if (chatId && messageId) {
-        if (data === "catalog") {
-          await showCatalog(chatId, messageId);
-        } else if (data === "home") {
-          await showHome(chatId, messageId);
-        } else if (data === "my_orders") {
-          await showMyOrders(chatId, messageId);
-        } else if (data === "admin") {
-          await showAdminInfo(chatId, telegramId, messageId);
-        } else if (data.startsWith("product:")) {
-          const productId = Number(
-            data.slice("product:".length)
-          );
+      if (!chatId || !messageId) {
+        return res.status(200).json({ ok: true });
+      }
 
-          if (
-            Number.isSafeInteger(productId) &&
-            productId > 0
-          ) {
-            await showProduct(chatId, productId, messageId);
-          } else {
-            await editMessage(
-              chatId,
-              messageId,
-              "❌ Некорректный товар.",
-              {
-                inline_keyboard: [
-                  [{ text: "⬅️ В каталог", callback_data: "catalog" }]
-                ]
-              }
-            );
+      if (data === "home") {
+        if (isAdmin(telegramId)) {
+          await clearSession(telegramId);
+        }
+
+        await showHome(chatId, messageId, telegramId);
+      } else if (data === "catalog") {
+        await showCatalog(chatId, messageId);
+      } else if (data === "my_orders") {
+        await render(
+          chatId,
+          messageId,
+          "👤 Мои покупки\n\nИстория заказов появится после подключения оплаты.",
+          {
+            inline_keyboard: [
+              [{ text: "🛒 Каталог", callback_data: "catalog" }],
+              [{ text: "⬅️ В меню", callback_data: "home" }]
+            ]
           }
+        );
+      } else if (data.startsWith("product:")) {
+        const productId = Number(data.slice("product:".length));
+
+        if (Number.isSafeInteger(productId) && productId > 0) {
+          await showPublicProduct(chatId, productId, messageId);
+        }
+      } else if (data === "admin:home") {
+        await clearSession(telegramId);
+        await showAdminPanel(chatId, messageId);
+      } else if (data === "admin:cancel") {
+        const session = await getSession(telegramId);
+        await clearSession(telegramId);
+
+        if (session) {
+          await showAdminPanel(session.chatId, session.messageId);
+        } else {
+          await showAdminPanel(chatId, messageId);
+        }
+      } else if (data === "admin:new") {
+        await beginSession(
+          telegramId,
+          chatId,
+          messageId,
+          "create_name",
+          {},
+          "➕ Создание товара\n\nВведи название товара:"
+        );
+      } else if (data === "admin:products") {
+        await clearSession(telegramId);
+        await showAdminProducts(chatId, messageId);
+      } else if (data === "admin:stock") {
+        await clearSession(telegramId);
+        await showStock(chatId, messageId);
+      } else if (data.startsWith("admin:product:")) {
+        const productId = Number(data.split(":")[2]);
+
+        if (Number.isSafeInteger(productId) && productId > 0) {
+          await clearSession(telegramId);
+          await showAdminProduct(chatId, messageId, productId);
+        }
+      } else if (data.startsWith("admin:stockprod:")) {
+        const productId = Number(data.split(":")[2]);
+
+        if (Number.isSafeInteger(productId) && productId > 0) {
+          await clearSession(telegramId);
+          await showStockProduct(chatId, messageId, productId);
+        }
+      } else if (data.startsWith("admin:addstock:")) {
+        const productId = Number(data.split(":")[2]);
+
+        if (Number.isSafeInteger(productId) && productId > 0) {
+          await beginStockUpload(telegramId, chatId, messageId, productId);
+        }
+      } else if (data.startsWith("admin:edit:")) {
+        const [, , idText, fieldName] = data.split(":");
+        const productId = Number(idText);
+        const field = EDIT_FIELDS[fieldName];
+
+        if (
+          Number.isSafeInteger(productId) &&
+          productId > 0 &&
+          field
+        ) {
+          await beginSession(
+            telegramId,
+            chatId,
+            messageId,
+            "edit_product",
+            { productId, field: fieldName },
+            `✏️ Изменение поля «${field.label}»\n\n${field.prompt}`
+          );
+        }
+      } else if (data.startsWith("admin:toggle:")) {
+        const productId = Number(data.split(":")[2]);
+
+        if (Number.isSafeInteger(productId) && productId > 0) {
+          await db.execute({
+            sql: `
+              UPDATE products
+              SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END
+              WHERE id = ?
+            `,
+            args: [productId]
+          });
+
+          await showAdminProduct(chatId, messageId, productId);
         }
       }
     }
